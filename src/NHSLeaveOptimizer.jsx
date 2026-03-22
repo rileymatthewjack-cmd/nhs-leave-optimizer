@@ -20,6 +20,7 @@ const SHIFT_TYPES = {
 const SHIFT_ALIASES = {
   "day": "D", "d": "D", "normal": "D", "standard": "D", "early": "D", "am": "D",
   "9-5": "D", "09:00": "D", "ward": "D", "clinic": "D", "theatre": "D",
+  "nwd": "D", "outreach": "D", "normal working day": "D",
   "long": "L", "long day": "L", "ld": "L", "12hr": "L", "12h": "L", "12": "L",
   "extended": "L", "on call": "L", "oncall": "L", "on-call": "L",
   "night": "N", "n": "N", "noc": "N", "twilight": "N",
@@ -266,8 +267,18 @@ export default function NHSLeaveOptimizer() {
         const result = detectAndParse(rows);
         if (!result) { setUploadStatus("error"); setUploadResult(null); return; }
         if (result.format === "pattern-only") { setUploadStatus("pattern-only"); setUploadResult(result); return; }
+
+        // Auto-detect date range from the uploaded file
+        const parsedDates = Object.keys(result.shifts).sort();
+        const detectedStart = parsedDates[0];
+        const detectedEnd = parsedDates[parsedDates.length - 1];
+        const useStart = detectedStart || rotaStart;
+        const useEnd = detectedEnd || rotaEnd;
+        setRotaStart(useStart);
+        setRotaEnd(useEnd);
+
         const newShifts = {};
-        let c = new Date(rotaStart); const end = new Date(rotaEnd);
+        let c = new Date(useStart); const end = new Date(useEnd);
         while (c <= end) {
           const ds = dateStr(c);
           if (result.shifts[ds]) newShifts[ds] = result.shifts[ds];
