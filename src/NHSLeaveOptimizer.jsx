@@ -408,6 +408,10 @@ export default function NHSLeaveOptimizer() {
       c = addDays(c, 1);
     }
     setShifts(newShifts);
+    // Auto-lock any AL days that were already in the uploaded rota
+    const uploadedAL = new Set();
+    Object.entries(newShifts).forEach(([ds, s]) => { if (s === "AL") uploadedAL.add(ds); });
+    setLockedAL(uploadedAL);
     setUnmappedShifts(result.unmapped || []);
     setUploadStatus("success");
     setUploadResult(result);
@@ -476,21 +480,28 @@ export default function NHSLeaveOptimizer() {
       if (nl.has(ds)) {
         nl.delete(ds);
         if (isBankHoliday(ds)) ns[ds] = "BH"; else if (isWeekend(ds)) ns[ds] = "W"; else ns[ds] = "D";
-      } else if (!protectedShifts.has(shifts[ds]) && shifts[ds] !== "O" && shifts[ds] !== "W") { nl.add(ds); ns[ds] = "AL"; }
+      } else if (nl.size < alAllowance && !protectedShifts.has(shifts[ds]) && shifts[ds] !== "O" && shifts[ds] !== "W") {
+        nl.add(ds); ns[ds] = "AL";
+      }
       setLockedAL(nl); setShifts(ns); return;
     }
     if (step === 1) setShifts(prev => ({ ...prev, [ds]: paintMode }));
-  }, [step, paintMode, shifts, lockedAL, protectedShifts]);
+  }, [step, paintMode, shifts, lockedAL, protectedShifts, alAllowance]);
 
   const handleMouseDown = useCallback((ds) => { if (step !== 1) return; setIsPainting(true); setShifts(prev => ({ ...prev, [ds]: paintMode })); }, [step, paintMode]);
   const handleMouseEnter = useCallback((ds) => { if (step !== 1 || !isPainting) return; setShifts(prev => ({ ...prev, [ds]: paintMode })); }, [step, paintMode, isPainting]);
   const handleMouseUp = useCallback(() => setIsPainting(false), []);
 
   const runOptimizer = useCallback(() => {
-    const available = alAllowance - lockedAL.size;
+    const available = Math.max(0, alAllowance - lockedAL.size);
     const result = optimizeLeave(shifts, available, protectedShifts);
     const ns = { ...shifts };
-    result.selectedDates.forEach(d => { if (!lockedAL.has(d)) ns[d] = "AL"; });
+    // Hard cap: only apply up to 'available' optimized days
+    let applied = 0;
+    for (const d of result.selectedDates) {
+      if (applied >= available) break;
+      if (!lockedAL.has(d)) { ns[d] = "AL"; applied++; }
+    }
     setShifts(ns); setOptimResult(result); setStep(3);
   }, [shifts, alAllowance, lockedAL, protectedShifts]);
 
