@@ -92,6 +92,131 @@ function parseCSV(text) {
   });
 }
 
+// Month abbreviations for Allocate Optima date format (e.g. "06-Dec-23")
+const MONTH_ABBR = { jan:"01", feb:"02", mar:"03", apr:"04", may:"05", jun:"06", jul:"07", aug:"08", sep:"09", oct:"10", nov:"11", dec:"12" };
+
+function parseAllocateDate(raw) {
+  // Matches "06-Dec-23" or "01-Jan-24" etc.
+  const m = raw.match(/(\d{1,2})-([A-Za-z]{3})-(\d{2})/);
+  if (!m) return null;
+  const day = m[1].padStart(2, "0");
+  const mon = MONTH_ABBR[m[2].toLowerCase()];
+  if (!mon) return null;
+  const year = parseInt(m[3]) > 50 ? `19${m[3]}` : `20${m[3]}`;
+  return `${year}-${mon}-${day}`;
+}
+
+async function loadPdfJs() {
+  if (window.pdfjsLib) return window.pdfjsLib;
+  return new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+    script.onload = () => {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+      resolve(window.pdfjsLib);
+    };
+    script.onerror = reject;
+    document.head.appendChild(script);
+  });
+}
+
+async function parsePDF(arrayBuffer) {
+  const pdfjsLib = await loadPdfJs();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const shifts = {};
+  const unmapped = [];
+
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const textContent = await page.getTextContent();
+
+    // Group text items into lines by Y coordinate
+    const lines = {};
+    for (const item of textContent.items) {
+      const y = Math.round(item.transform[5]); // Y position
+      if (!lines[y]) lines[y] = [];
+      lines[y].push({ x: item.transform[4], text: item.str });
+    }
+
+    // Sort lines top-to-bottom, items left-to-right
+    const sortedYs = Object.keys(lines).map(Number).sort((a, b) => b - a);
+
+    for (const y of sortedYs) {
+      const items = lines[y].sort((a, b) => a.x - b.x);
+      const lineText = items.map(i => i.text).join(" ");
+
+      // Look for Allocate Optima date pattern anywhere in the line
+      const dateMatch = lineText.match(/(\d{1,2}-[A-Za-z]{3}-\d{2})/);
+      if (!dateMatch) continue;
+
+      const ds = parseAllocateDate(dateMatch[1]);
+      if (!ds) continue;
+
+      // Extract shift name — look for known shift keywords after the date
+      // Typical line: "Wed 06-Dec-23 08:30-17:00 Outreach - - Medics ITU 8:30"
+      // Or just: "Sat 09-Dec-23" (no shift = off)
+      const afterDate = lineText.substring(lineText.indexOf(dateMatch[0]) + dateMatch[0].length).trim();
+
+      if (!afterDate || afterDate === "-" || afterDate.match(/^[\s\-]*$/)) {
+        // No shift info — it's an off day
+        shifts[ds] = isBankHoliday(ds) ? "BH" : "O";
+        continue;
+      }
+
+      // Try to find a shift name (Outreach, Night, LD, NWD, A/L, etc.)
+      // Look for the Name column value — usually the first word after the time range
+      const timePattern = /\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}/;
+      const timeMatch = afterDate.match(timePattern);
+
+      let shiftName = null;
+      if (timeMatch) {
+        // Get text after the time
+        const afterTime = afterDate.substring(afterDate.indexOf(timeMatch[0]) + timeMatch[0].length).trim();
+        // First meaningful word is the shift name
+        const words = afterTime.split(/\s+/);
+        for (const w of words) {
+          if (w === "-" || w === "" || w.match(/^\d/)) continue;
+          shiftName = w;
+          break;
+        }
+      } else {
+        // No time — might just have the shift name
+        const words = afterDate.split(/\s+/);
+        for (const w of words) {
+          if (w === "-" || w === "" || w.match(/^\d/)) continue;
+          shiftName = w;
+          break;
+        }
+      }
+
+      if (shiftName) {
+        const code = parseShiftText(shiftName);
+        if (code) {
+          shifts[ds] = isBankHoliday(ds) && code !== "AL" ? "BH" : code;
+        } else {
+          // Try time-based detection as fallback
+          if (timeMatch) {
+            const timeCode = parseShiftText(timeMatch[0]);
+            if (timeCode) {
+              shifts[ds] = isBankHoliday(ds) && timeCode !== "AL" ? "BH" : timeCode;
+            } else {
+              unmapped.push({ date: ds, raw: shiftName });
+              shifts[ds] = "D";
+            }
+          } else {
+            unmapped.push({ date: ds, raw: shiftName });
+            shifts[ds] = "D";
+          }
+        }
+      } else {
+        shifts[ds] = isBankHoliday(ds) ? "BH" : "O";
+      }
+    }
+  }
+
+  return { shifts, unmapped, format: "pdf-allocate" };
+}
+
 function detectAndParse(rows) {
   if (rows.length < 2) return null;
   const header = rows[0];
@@ -164,22 +289,31 @@ function detectAndParse(rows) {
   return null;
 }
 
-function optimizeLeave(shifts, alDays) {
+function optimizeLeave(shifts, alDays, protectedShifts = new Set()) {
   const dates = Object.keys(shifts).sort();
   if (dates.length === 0 || alDays <= 0) return { selectedDates: [], recommendations: [], remaining: alDays };
   const isOff = ds => { const s = shifts[ds]; return s === "O" || s === "W" || s === "R" || s === "BH" || s === "AL"; };
+  const isProtected = ds => protectedShifts.has(shifts[ds]);
+  // A day is replaceable with AL only if it's not off and not protected
+  const canReplace = ds => !isOff(ds) && !isProtected(ds);
+  // For streak counting, off days and protected days both count as "not replaceable"
+  const isNonReplaceable = ds => !canReplace(ds);
+
+  // Build work blocks of only replaceable days
   let workBlocks = [], i = 0, len = dates.length;
   while (i < len) {
-    if (!isOff(dates[i])) { let start = i; while (i < len && !isOff(dates[i])) i++; workBlocks.push({ startIdx: start, endIdx: i - 1 }); }
+    if (canReplace(dates[i])) { let start = i; while (i < len && canReplace(dates[i])) i++; workBlocks.push({ startIdx: start, endIdx: i - 1 }); }
     else i++;
   }
   const results = [];
+  // For adjacent off counting, count both off AND protected days as "adjacent off" for efficiency calc
+  const isOffOrProtected = ds => isOff(ds) || isProtected(ds);
   for (const block of workBlocks) {
     const alCost = block.endIdx - block.startIdx + 1;
     let offBefore = 0, idx = block.startIdx - 1;
-    while (idx >= 0 && isOff(dates[idx])) { offBefore++; idx--; }
+    while (idx >= 0 && isOffOrProtected(dates[idx])) { offBefore++; idx--; }
     let offAfter = 0; idx = block.endIdx + 1;
-    while (idx < len && isOff(dates[idx])) { offAfter++; idx++; }
+    while (idx < len && isOffOrProtected(dates[idx])) { offAfter++; idx++; }
     results.push({ alCost, totalOff: offBefore + alCost + offAfter, efficiency: (offBefore + alCost + offAfter) / alCost, dates: dates.slice(block.startIdx, block.endIdx + 1), offBefore, offAfter, startDate: dates[block.startIdx], endDate: dates[block.endIdx] });
   }
   results.sort((a, b) => b.efficiency - a.efficiency || b.totalOff - a.totalOff);
@@ -230,6 +364,7 @@ export default function NHSLeaveOptimizer() {
   const [selectedTemplate, setSelectedTemplate] = useState("custom");
   const [fileName, setFileName] = useState("");
   const [previewData, setPreviewData] = useState(null);
+  const [protectedShifts, setProtectedShifts] = useState(new Set(["N", "R", "BH"]));
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -253,48 +388,66 @@ export default function NHSLeaveOptimizer() {
     setShifts(ns);
   }, [rotaStart, rotaEnd]);
 
-  const handleFileUpload = useCallback((e) => {
+  const applyResult = useCallback((result) => {
+    const parsedDates = Object.keys(result.shifts).sort();
+    const detectedStart = parsedDates[0];
+    const detectedEnd = parsedDates[parsedDates.length - 1];
+    const useStart = detectedStart || rotaStart;
+    const useEnd = detectedEnd || rotaEnd;
+    setRotaStart(useStart);
+    setRotaEnd(useEnd);
+
+    const newShifts = {};
+    let c = new Date(useStart); const end = new Date(useEnd);
+    while (c <= end) {
+      const ds = dateStr(c);
+      if (result.shifts[ds]) newShifts[ds] = result.shifts[ds];
+      else if (isBankHoliday(ds)) newShifts[ds] = "BH";
+      else if (isWeekend(ds)) newShifts[ds] = "W";
+      else newShifts[ds] = "D";
+      c = addDays(c, 1);
+    }
+    setShifts(newShifts);
+    setUnmappedShifts(result.unmapped || []);
+    setUploadStatus("success");
+    setUploadResult(result);
+  }, [rotaStart, rotaEnd]);
+
+  const handleFileUpload = useCallback(async (e) => {
     const file = e.target.files[0];
     if (!file) return;
     setFileName(file.name);
     setUploadStatus("parsing");
-    const reader = new FileReader();
-    reader.onload = (evt) => {
-      try {
-        const text = evt.target.result;
+
+    const isPDF = file.name.toLowerCase().endsWith(".pdf") || file.type === "application/pdf";
+
+    try {
+      if (isPDF) {
+        // PDF path
+        const arrayBuffer = await file.arrayBuffer();
+        const result = await parsePDF(arrayBuffer);
+        if (!result || Object.keys(result.shifts).length === 0) {
+          setUploadStatus("error");
+          setUploadResult(null);
+          return;
+        }
+        setPreviewData(null);
+        applyResult(result);
+      } else {
+        // CSV path
+        const text = await file.text();
         const rows = parseCSV(text);
         setPreviewData(rows.slice(0, 8));
         const result = detectAndParse(rows);
         if (!result) { setUploadStatus("error"); setUploadResult(null); return; }
         if (result.format === "pattern-only") { setUploadStatus("pattern-only"); setUploadResult(result); return; }
-
-        // Auto-detect date range from the uploaded file
-        const parsedDates = Object.keys(result.shifts).sort();
-        const detectedStart = parsedDates[0];
-        const detectedEnd = parsedDates[parsedDates.length - 1];
-        const useStart = detectedStart || rotaStart;
-        const useEnd = detectedEnd || rotaEnd;
-        setRotaStart(useStart);
-        setRotaEnd(useEnd);
-
-        const newShifts = {};
-        let c = new Date(useStart); const end = new Date(useEnd);
-        while (c <= end) {
-          const ds = dateStr(c);
-          if (result.shifts[ds]) newShifts[ds] = result.shifts[ds];
-          else if (isBankHoliday(ds)) newShifts[ds] = "BH";
-          else if (isWeekend(ds)) newShifts[ds] = "W";
-          else newShifts[ds] = "D";
-          c = addDays(c, 1);
-        }
-        setShifts(newShifts);
-        setUnmappedShifts(result.unmapped || []);
-        setUploadStatus("success");
-        setUploadResult(result);
-      } catch (err) { console.error(err); setUploadStatus("error"); }
-    };
-    reader.readAsText(file);
-  }, [rotaStart, rotaEnd]);
+        applyResult(result);
+      }
+    } catch (err) {
+      console.error(err);
+      setUploadStatus("error");
+    }
+  }, [rotaStart, rotaEnd, applyResult]);
 
   const applyPattern = useCallback((pattern, startDate) => {
     const ns = {};
@@ -323,11 +476,11 @@ export default function NHSLeaveOptimizer() {
       if (nl.has(ds)) {
         nl.delete(ds);
         if (isBankHoliday(ds)) ns[ds] = "BH"; else if (isWeekend(ds)) ns[ds] = "W"; else ns[ds] = "D";
-      } else if (!["R","BH","O","W"].includes(shifts[ds])) { nl.add(ds); ns[ds] = "AL"; }
+      } else if (!protectedShifts.has(shifts[ds]) && shifts[ds] !== "O" && shifts[ds] !== "W") { nl.add(ds); ns[ds] = "AL"; }
       setLockedAL(nl); setShifts(ns); return;
     }
     if (step === 1) setShifts(prev => ({ ...prev, [ds]: paintMode }));
-  }, [step, paintMode, shifts, lockedAL]);
+  }, [step, paintMode, shifts, lockedAL, protectedShifts]);
 
   const handleMouseDown = useCallback((ds) => { if (step !== 1) return; setIsPainting(true); setShifts(prev => ({ ...prev, [ds]: paintMode })); }, [step, paintMode]);
   const handleMouseEnter = useCallback((ds) => { if (step !== 1 || !isPainting) return; setShifts(prev => ({ ...prev, [ds]: paintMode })); }, [step, paintMode, isPainting]);
@@ -335,11 +488,11 @@ export default function NHSLeaveOptimizer() {
 
   const runOptimizer = useCallback(() => {
     const available = alAllowance - lockedAL.size;
-    const result = optimizeLeave(shifts, available);
+    const result = optimizeLeave(shifts, available, protectedShifts);
     const ns = { ...shifts };
     result.selectedDates.forEach(d => { if (!lockedAL.has(d)) ns[d] = "AL"; });
     setShifts(ns); setOptimResult(result); setStep(3);
-  }, [shifts, alAllowance, lockedAL]);
+  }, [shifts, alAllowance, lockedAL, protectedShifts]);
 
   const clearOptimized = useCallback(() => {
     const ns = { ...shifts };
@@ -485,23 +638,23 @@ export default function NHSLeaveOptimizer() {
             <div className="glass" style={{ padding: 28, marginBottom: 16 }}>
               <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>Upload Your Rota</h2>
               <p style={{ fontSize: 13, color: "#94a3b8", marginBottom: 20, lineHeight: 1.6 }}>
-                Upload a CSV export of your rota from HealthRoster, Allocate, CLWRota, or similar. The parser auto-detects dates and shift types across multiple common formats.
+                Upload a CSV or PDF export of your rota from HealthRoster, Allocate, CLWRota, or similar. The parser auto-detects dates and shift types across multiple common formats.
               </p>
 
-              <input ref={fileInputRef} type="file" accept=".csv,.tsv,.txt" style={{ display: "none" }} onChange={handleFileUpload} />
+              <input ref={fileInputRef} type="file" accept=".csv,.tsv,.txt,.pdf" style={{ display: "none" }} onChange={handleFileUpload} />
 
               <div className={`upload-zone ${uploadStatus === "success" ? "active" : ""}`} onClick={() => fileInputRef.current?.click()}>
                 {!uploadStatus && (<>
                   <div style={{ fontSize: 36, marginBottom: 8 }}>📄</div>
                   <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 4 }}>Click to upload your rota file</div>
-                  <div style={{ fontSize: 12, color: "#64748b" }}>CSV, TSV, or tab-delimited text</div>
+                  <div style={{ fontSize: 12, color: "#64748b" }}>PDF, CSV, TSV, or tab-delimited text · Supports Allocate Optima PDF exports</div>
                 </>)}
                 {uploadStatus === "parsing" && <div style={{ fontSize: 15 }}>Parsing…</div>}
                 {uploadStatus === "success" && (<>
                   <div style={{ fontSize: 36, marginBottom: 8 }}>✅</div>
                   <div style={{ fontSize: 15, fontWeight: 600, color: "#10b981" }}>Rota parsed successfully</div>
                   <div style={{ fontSize: 12, color: "#94a3b8", marginTop: 4 }}>
-                    {fileName} · {Object.keys(shifts).length} days loaded · {uploadResult?.format === "date-per-row" ? "date-per-row format" : uploadResult?.format === "date-per-column" ? `grid format (row: ${uploadResult.rowLabel})` : "pattern"}
+                    {fileName} · {Object.keys(shifts).length} days loaded · {uploadResult?.format === "pdf-allocate" ? "Allocate Optima PDF" : uploadResult?.format === "date-per-row" ? "date-per-row format" : uploadResult?.format === "date-per-column" ? `grid format (row: ${uploadResult.rowLabel})` : "pattern"}
                   </div>
                 </>)}
                 {uploadStatus === "pattern-only" && (<>
@@ -660,6 +813,33 @@ export default function NHSLeaveOptimizer() {
                 <div style={{ background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 10, padding: "10px 16px" }}>
                   <span style={{ fontSize: 11, color: "#94a3b8", fontWeight: 600 }}>LOCKED</span>
                   <div style={{ fontSize: 22, fontWeight: 700, color: "#f59e0b", fontFamily: "'JetBrains Mono', monospace" }}>{lockedAL.size}</div>
+                </div>
+              </div>
+
+              {/* Protected shift types */}
+              <div style={{ marginTop: 16 }}>
+                <div style={{ fontSize: 11, fontWeight: 600, color: "#94a3b8", textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>Can't book AL over these shift types:</div>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {Object.entries(SHIFT_TYPES).filter(([k]) => !["O","W","AL"].includes(k)).map(([key, val]) => {
+                    const isProtected = protectedShifts.has(key);
+                    return (
+                      <button key={key} onClick={() => {
+                        const ns = new Set(protectedShifts);
+                        if (isProtected) ns.delete(key); else ns.add(key);
+                        setProtectedShifts(ns);
+                      }}
+                      style={{
+                        padding: "6px 12px", borderRadius: 8, fontSize: 12, fontWeight: 600,
+                        cursor: "pointer", fontFamily: "inherit", transition: "all 0.15s",
+                        background: isProtected ? val.bg : "rgba(255,255,255,0.04)",
+                        color: isProtected ? val.color : "#475569",
+                        border: isProtected ? `2px solid ${val.color}` : "2px solid rgba(255,255,255,0.08)",
+                        opacity: isProtected ? 1 : 0.5,
+                      }}>
+                        {isProtected ? "🔒 " : ""}{val.label}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
             </div>
